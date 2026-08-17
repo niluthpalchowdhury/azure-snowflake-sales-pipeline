@@ -1,0 +1,24 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "RISTA_API_KEY": "<rista-api-key>",
+    "RISTA_SECRET_KEY": "<rista-secret-key>",
+    "RISTA_BASE_URL": "https://api.ristaapps.com",
+
+    "AZURE_STORAGE_ACCOUNT": "<storage-account>",
+    "AZURE_STORAGE_KEY": "<storage-key>",
+    "AZURE_RAW_CONTAINER": "raw",
+    "AZURE_ERROR_CONTAINER": "errors",
+
+    "TARGET_DAY": "",
+    "TARGET_DAYS": "",
+    "PIPELINE_TIMEZONE": "Asia/Kolkata",
+
+    "EXTRACTOR_RUN_BUDGET_SECONDS": "480",
+    "EXTRACTOR_LEASE_SECONDS": "60",
+    "API_CALL_LOG_DIR": ""
+  }
+}

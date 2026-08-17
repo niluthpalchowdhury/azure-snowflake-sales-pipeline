@@ -1,0 +1,25 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "AZURE_STORAGE_ACCOUNT": "<storage-account>",
+    "AZURE_STORAGE_KEY": "<storage-key>",
+    "AZURE_RAW_CONTAINER": "raw",
+    "AZURE_ERROR_CONTAINER": "errors",
+
+    "SNOWFLAKE_ACCOUNT": "<account>",
+    "SNOWFLAKE_USER": "<service-user>",
+    "SNOWFLAKE_PRIVATE_KEY": "<pem-body-only-or-json-with-\\n-line-breaks>",
+    "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE": "",
+    "SNOWFLAKE_DATABASE": "SALES_DB",
+    "SNOWFLAKE_SCHEMA": "RAW",
+    "SNOWFLAKE_WAREHOUSE": "SALES_WH",
+    "SNOWFLAKE_ROLE": "SALES_LOADER_ROLE",
+
+    "TARGET_DAY": "",
+    "TARGET_DAYS": "",
+    "PIPELINE_TIMEZONE": "Asia/Kolkata"
+  }
+}

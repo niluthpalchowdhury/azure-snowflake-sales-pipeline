@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+local.settings.json
+.python_packages
+tests/
+conftest.py
+requirements-dev.txt
+.pytest_cache/

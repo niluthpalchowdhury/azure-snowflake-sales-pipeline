@@ -1,0 +1,35 @@
+# ---- Secrets and local configuration — never commit ----
+local.settings.json
+.env
+.env.*
+*.p8
+*.pem
+*.key
+*.pfx
+snowflake_key*
+**/local.settings.json
+
+# ---- Python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.python_packages/
+
+# ---- Test and coverage artifacts ----
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---- Local runtime output ----
+extractor_app/logs/
+transformer_app/logs/
+*.parquet
+
+# ---- Editors and OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
