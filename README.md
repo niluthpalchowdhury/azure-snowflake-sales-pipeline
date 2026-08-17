@@ -13,6 +13,7 @@ Roughly 350 restaurant branches, one business day at a time. Every invoice, plus
 | Source | Rista POS REST API, JWT-signed, cursor-paginated per branch per day |
 | Staging | Azure Blob Storage, gzipped JSON, one snapshot per business day |
 | Warehouse | Snowflake, `SALES_DB.RAW`, key-pair auth, `write_pandas` bulk load |
+| Curated layer | Snowflake streams and serverless tasks keep `SALES_DB.CURATED` current with a change-driven incremental `MERGE`, touching only invoices that actually moved |
 | Schedule | Extractor every 10 minutes, transformer every 30 |
 | Runtime | Python 3.11 on Azure Functions, Linux Consumption plan |
 
@@ -58,13 +59,31 @@ flowchart TB
         T1["flatten to 13 row sets"] --> T2["replace the whole day"]
     end
 
-    SF["Snowflake · SALES_DB.RAW<br>13 tables"]
+    SF["Snowflake · SALES_DB.RAW<br>13 tables, replaced one day at a time"]
+
+    subgraph CDC["SNOWFLAKE STREAM + SERVERLESS TASK"]
+        direction LR
+        STR["STREAM on SALES_HEADER<br><i>inserts and updates</i>"] --> MRG["hourly MERGE task<br><i>skipped when the stream is empty</i>"]
+    end
+
+    MAIN["SALES_DB.CURATED.MAIN<br><i>changed invoices merged in place</i>"]
+
+    NETS["safety nets<br><i>daily re-sync, weekly rebuild, daily non-POS load</i>"]
+
+    STAR["STAR SCHEMA · one serverless task each<br>DIM_DATE · DIM_BRANCH · FACT_ORDER_DATA"]
+
+    BI["Power BI"]
 
     POS --> EXT
     EXT -.->|"progress, every run"| B1
     EXT ==>|"once all branches are done"| B2
     B2 ==>|"only if extractedAt changed"| TRF
     TRF -->|"one transaction"| SF
+    SF ==> CDC
+    CDC ==>|"MERGE on invoice number"| MAIN
+    NETS -.->|"catch what the stream missed"| MAIN
+    MAIN ==> STAR
+    STAR --> BI
 ```
 
 The two function apps share no code and no dependencies. The extractor has never heard of Snowflake; the transformer has never heard of Rista. Their entire contract is a gzipped JSON file and a status field in a checkpoint. Either one can be redeployed, rolled back or triggered by hand without touching the other, which matters more than it sounds when you are debugging a bad day of data at 9am.
@@ -131,6 +150,81 @@ The transformer wakes up every 30 minutes. That's 48 runs a day, against days th
 It uses the extraction timestamp as a fingerprint. Each successful load writes the snapshot's `extractedAt` into `transform_checkpoint.json`, and a day is only reloaded when the snapshot's timestamp differs from the recorded one. Re-extracting a day naturally produces a new timestamp, so refreshed days get picked up on their own and untouched days cost one blob read.
 
 The load itself replaces a whole business day inside one transaction: delete every row for that `LAST_EXTRACTED_DAY` across all 13 tables, bulk insert the snapshot, convert the JSON string columns to native `VARIANT`, commit. Any failure rolls back the lot, so a day is either fully replaced or completely untouched. Never half-loaded, which is the state you really don't want to debug.
+
+## The incremental layer — change data capture in Snowflake
+
+The raw layer is a faithful copy of whatever the POS API said, one business day at a time. It is not what anyone queries. On top of it sits a curated model, and keeping that current turns out to be a different problem from loading raw in the first place.
+
+The complication is that invoices don't sit still. A bill gets refunded, voided or amended hours or sometimes days after it was first closed. When that happens the day gets re-extracted, the transformer replaces it in raw, and the invoice comes back as a rewritten row with a fresh `UPDATED_AT`. So the curated table cannot simply collect new invoices. It has to absorb changes to invoices it already has.
+
+Two approaches present themselves and both are bad. Rebuild the curated table every hour and you pay to reprocess millions of rows that nobody touched, all day, forever. Only append new invoices and you are fast, cheap and quietly wrong: every refund and cancellation goes missing, and the numbers drift away from raw in a direction nobody notices until someone reconciles a month by hand.
+
+What runs instead is a stream and a task.
+
+### The stream has to see updates, not just inserts
+
+A Snowflake `STREAM` on the raw header table records what changed since it was last read. The important part is the flag:
+
+```sql
+CREATE OR REPLACE STREAM SALES_DB.CURATED.SALES_HEADER_STREAM
+  ON TABLE SALES_DB.RAW.SALES_HEADER
+  APPEND_ONLY = FALSE;
+```
+
+`APPEND_ONLY = TRUE` would be cheaper and would have been the wrong choice. Because the transformer replaces a day with a delete followed by an insert, an amended invoice arrives as a *changed* row rather than a brand-new one. An append-only stream shows you first-time invoices and silently drops every late refund. `APPEND_ONLY = FALSE` surfaces both, which is the entire reason the curated numbers match raw.
+
+### The task only runs when there's something to do
+
+```sql
+CREATE OR REPLACE TASK SALES_DB.CURATED.TASK_MERGE_MAIN_HOURLY
+  SCHEDULE = '60 MINUTE'
+WHEN
+  SYSTEM$STREAM_HAS_DATA('SALES_DB.CURATED.SALES_HEADER_STREAM')
+AS
+MERGE INTO SALES_DB.CURATED.MAIN AS tgt
+USING (
+    SELECT h.*
+    FROM SALES_DB.RAW.SALES_HEADER h
+    WHERE h.INVOICE_NUMBER IN (
+              SELECT INVOICE_NUMBER
+              FROM SALES_DB.CURATED.SALES_HEADER_STREAM
+          )
+      AND h.INVOICE_DAY >= '<seed-date>'   -- hardcoded literal; should be configuration
+) AS src
+   ON tgt.INVOICE_NUMBER = src.INVOICE_NUMBER
+ WHEN MATCHED     THEN UPDATE SET tgt.NET_AMOUNT = src.NET_AMOUNT /* ...remaining columns... */
+ WHEN NOT MATCHED THEN INSERT /* ...columns... */ VALUES /* ...values... */;
+```
+
+Three things in there earn their place.
+
+`WHEN SYSTEM$STREAM_HAS_DATA(...)` means an idle hour costs nothing. The task wakes, checks the stream, finds it empty and goes back to sleep without starting compute. On a quiet night that is 8 or 9 consecutive no-ops that never appear on the bill.
+
+No `WAREHOUSE` clause, which makes it a serverless task. Snowflake sizes and bills it per second of actual execution instead of holding a warehouse up for a minimum billing interval. For a job that runs for a few seconds an hour, that difference is most of the cost.
+
+The `IN (SELECT INVOICE_NUMBER FROM ...stream)` filter is the part that makes this incremental rather than decorative. The `MERGE` reads columns from raw, but only for invoice numbers the stream says moved. A quiet hour with 40 amended bills merges 40 invoices, not the whole table.
+
+### Defense in depth, because streams can be missed
+
+A stream offset advances when it is read. If a task fails, or is suspended, or somebody drops and recreates the stream during a deployment, changes can slip past. So the hourly task isn't trusted on its own:
+
+- A **daily re-sync task** merges the recent window unconditionally, with no stream gate. Slower, but it catches anything the hourly path missed while it was down.
+- A **weekly full rebuild task** deletes and re-inserts the window outright, which corrects drift that a merge cannot — rows that should no longer exist at all, for instance.
+- A **daily non-POS load task** brings in order sources that never come through the POS API, so the curated table isn't limited to what the extractor can see.
+
+The pattern is deliberately layered by cost and frequency: cheap and often, moderate and daily, expensive and weekly. Each layer only has to catch what the one above it dropped.
+
+### The star schema on top
+
+Downstream of `MAIN` is a small star schema feeding Power BI, each object maintained by its own serverless task:
+
+| Object | Refresh | Why |
+|---|---|---|
+| `DIM_DATE` | built once | Static calendar, nothing to refresh |
+| `DIM_BRANCH` | daily, idempotent merge | Branches change rarely; a daily merge is plenty |
+| `FACT_ORDER_DATA` | hourly merge, matching `MAIN` | Has to keep pace with the curated table it reflects |
+
+These started out as dynamic tables. Converting them to regular tables with explicit merge tasks gave up some convenience and bought back control over exactly when each object refreshes and what it costs. With dynamic tables the refresh cadence is a target lag you ask for; with tasks it's a schedule you set, and you can see precisely which statement ran and how long it took.
 
 ## Data model
 
@@ -255,6 +349,8 @@ There is **no change history**. If a bill is amended upstream and the day gets r
 
 I annotated the docs and SQL in place rather than deleting them, so the design is still on record without misleading anyone about what runs today.
 
+**The incremental layer doesn't close this gap.** It's worth being clear about, because "change data capture" sounds like it should. The stream detects that an invoice changed and the hourly task merges the new values into `MAIN` **in place**. `MAIN` therefore always holds the current state of an invoice and nothing else. When a refund rewrites a bill, the old figures are overwritten in raw and then overwritten in curated, and no table anywhere records that they used to be different. Row-level history would need either the audit table described above or a slowly-changing-dimension pattern in the curated layer. Neither exists. If you need to answer "what did this invoice look like last Tuesday", this pipeline cannot tell you.
+
 ### Bugs
 
 **The 7-day sweep can fail to drain, and blocks the normal schedule while it's stuck.** *(from code review)*
@@ -270,6 +366,8 @@ Setting `EXTRACTOR_FORCE_REFRESH=true` makes those days genuinely re-extract, wh
 ### Design limits
 
 **The delete key isn't the primary key.** Deletes target `LAST_EXTRACTED_DAY`. The declared primary key is `INVOICE_NUMBER`, and Snowflake doesn't enforce primary keys. If the same invoice ever turns up under two different `target_day` values you get two header rows and nothing notices, because the duplicate check in `sql/005` groups *within* a single `LAST_EXTRACTED_DAY`. A cross-day check would need adding.
+
+**The hourly merge is bounded by a hardcoded date literal.** The `USING` clause in the merge task filters on a seed business date written straight into the task definition rather than read from configuration. It works, but changing the window means recreating a task instead of editing a parameter, and there is nothing keeping that literal in step with the window the daily re-sync and weekly rebuild tasks assume. Three tasks with three independently hardcoded boundaries is a bug waiting to happen. It should be one parameter.
 
 **The two stages dedupe on different keys.** The extractor dedupes on `(branchCode, invoiceNumber)`; the loader dedupes headers on `invoiceNumber` alone. If two branches ever shared an invoice number, one header would win while child rows from both survive, quietly attaching children to the wrong branch's header. The loader logs a warning when it drops a duplicate, which is the only signal you'd get.
 
