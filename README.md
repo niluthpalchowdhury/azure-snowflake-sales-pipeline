@@ -1,339 +1,202 @@
 # Azure → Snowflake Sales Pipeline
 
-Serverless ELT that replicates restaurant point-of-sale invoices from the Rista POS API into a Snowflake raw layer, built as two decoupled Azure Functions with resumable, checkpointed extraction.
+A serverless ELT pipeline that pulls restaurant point-of-sale invoices from the Rista POS API into Snowflake. Two Azure Functions, decoupled through blob storage, with extraction that survives the 10-minute function timeout by checkpointing and resuming.
 
----
+This is an anonymized copy of something I built and ran in production. Resource names, warehouse objects and business identifiers have been swapped for placeholders. No credentials are in this repo or its history. The code and the behaviour are untouched, including the parts that don't work — those are written up in [Data quality and known limitations](#data-quality-and-known-limitations).
 
-## About this repository
+## What it moves
 
-This is an **anonymized version of real production work**. Infrastructure identifiers (resource
-groups, storage accounts, key vaults, function app names), Snowflake object names, and business
-identifiers have been replaced with generic placeholders. No credentials, keys, or connection
-strings exist in this repository or its history.
+Roughly 350 restaurant branches, one business day at a time. Every invoice, plus its line items, options, payments, charges, discounts, taxes, delivery details and event log, landing in 13 Snowflake tables.
 
-The code, architecture, and runtime behaviour are otherwise unchanged — including the rough edges.
-The [Data quality & known limitations](#data-quality--known-limitations) section documents what is
-broken, what was designed and never built, and where the design will hit its ceiling. That section
-is the most useful part of this README if you are evaluating the engineering rather than the
-feature list.
+| | |
+|---|---|
+| Source | Rista POS REST API, JWT-signed, cursor-paginated per branch per day |
+| Staging | Azure Blob Storage, gzipped JSON, one snapshot per business day |
+| Warehouse | Snowflake, `SALES_DB.RAW`, key-pair auth, `write_pandas` bulk load |
+| Schedule | Extractor every 10 minutes, transformer every 30 |
+| Runtime | Python 3.11 on Azure Functions, Linux Consumption plan |
 
----
+## The problem
 
-## Architecture
+A day of sales sits behind an endpoint that answers one branch at a time and pages through a cursor. Pulling a full day means about 350 separate fetch loops, each running until its cursor runs out.
+
+Azure Functions on the Consumption plan kills a run at 10 minutes.
+
+That division is the whole story. 600 seconds across 350 branches leaves you about **1.7 seconds per branch**, and that has to cover the HTTP round trip, however many pages that branch has, and JSON parsing. The request timeout in this codebase is 120 seconds. A single slow branch can burn two minutes by itself. There is no arrangement of "fetch it all in one invocation" that survives a bad afternoon on the vendor's side.
+
+Two obvious escapes, and why I passed on both:
+
+**Get a bigger host.** A Premium plan or a container lifts the timeout. It also means paying for warm compute 24 hours a day to run a job that does real work for maybe twenty minutes, and it doesn't actually solve anything. It moves the wall. Add branches, hit it again.
+
+**Fan out.** Split branches across parallel invocations. Now one polite API consumer becomes 350 impolite ones against a vendor endpoint with no documented rate limit, and partial failure gets much harder to reason about. When 40 of 350 workers fail, what state is the day in?
+
+So I stopped treating "a day" as the unit of work.
+
+The unit is **one branch**. Progress is a file in blob storage, not a variable in memory. A run claims a day, gets through as many branches as it can finish safely, writes down where it stopped, and exits green. Ten minutes later the timer fires and the next run reads the pending list and carries on. A day takes however many invocations it takes. Usually a handful. Nobody needs to care which.
+
+Everything else in the extractor follows from that.
+
+## How it fits together
 
 ```mermaid
-flowchart LR
-    API["Rista POS API<br/>/v1/branch/list<br/>/v1/sales/page"]
+flowchart TB
+    POS["Rista POS API<br>one branch per call, cursor-paginated"]
 
-    subgraph ext["extractor_app · Azure Function · timer, every 10 min"]
-        E1["Resolve work days<br/>(Timeline 1 / 7-day sweep)"]
-        E2["Fetch branch by branch<br/>cursor pagination"]
-        E3["Dedupe + accumulate"]
+    subgraph EXT["EXTRACTOR APP · timer, every 10 min"]
+        direction LR
+        E1["fetch one branch<br>all its pages"] --> E2["dedupe and accumulate"]
     end
 
-    subgraph blob["Azure Blob Storage · the only interface between the two apps"]
-        CK["checkpoint.json<br/>branch progress · lease · heartbeat"]
-        PD["partial_data.json.gz<br/>rows collected so far"]
-        FS["data.json.gz<br/>final immutable day snapshot"]
-        TC["transform_checkpoint.json<br/>load fingerprint"]
+    subgraph BLOB["AZURE BLOB"]
+        direction LR
+        B1["checkpoint.json + partial_data.json.gz<br><i>the extractor's own resume state</i>"]
+        B2["data.json.gz<br><i>one finished day — the handoff</i>"]
     end
 
-    subgraph tr["transformer_app · Azure Function · timer, every 30 min"]
-        T1["Fingerprint gate"]
-        T2["Flatten: 1 invoice to 13 row sets"]
-        T3["Delete day + bulk insert<br/>+ PARSE_JSON, one transaction"]
+    subgraph TRF["TRANSFORMER APP · timer, every 30 min"]
+        direction LR
+        T1["flatten to 13 row sets"] --> T2["replace the whole day"]
     end
 
-    SF["Snowflake<br/>SALES_DB.RAW<br/>13 current tables"]
+    SF["Snowflake · SALES_DB.RAW<br>13 tables"]
 
-    API -->|"JWT HS256 per request"| E2
-    E1 --> E2 --> E3
-    E2 <-->|"read · write · heartbeat"| CK
-    E3 -->|"written once per run"| PD
-    E3 -->|"when every branch is done"| FS
-    E2 -.->|"time budget hit: resume next tick"| E1
-
-    FS -->|"only when status = completed"| T1
-    T1 <-->|"compare extractedAt"| TC
-    T1 --> T2 --> T3 --> SF
+    POS --> EXT
+    EXT -.->|"progress, every run"| B1
+    EXT ==>|"once all branches are done"| B2
+    B2 ==>|"only if extractedAt changed"| TRF
+    TRF -->|"one transaction"| SF
 ```
 
-The two function apps **share no code and no dependencies**. The extractor has no Snowflake or
-pandas dependency; the transformer has no Rista or JWT dependency. Neither calls the other. Their
-entire contract is a gzipped JSON snapshot in blob storage plus a status field in a checkpoint
-file, which means either app can be redeployed, rolled back, or run manually without touching the
-other.
+The two function apps share no code and no dependencies. The extractor has never heard of Snowflake; the transformer has never heard of Rista. Their entire contract is a gzipped JSON file and a status field in a checkpoint. Either one can be redeployed, rolled back or triggered by hand without touching the other, which matters more than it sounds when you are debugging a bad day of data at 9am.
 
----
+Here's what one extractor invocation actually does:
 
-## The engineering problem
-
-**One business day of sales cannot be extracted in one function invocation.**
-
-The source API is paginated per branch per day. With roughly 350 branches, a full day means ~350
-independent cursor-paginated fetch loops. Azure Functions on a Consumption plan caps out at 10
-minutes. A naive implementation gets killed mid-day, every day, and leaves partial state behind
-with no way to tell how far it got.
-
-The obvious fixes were both unattractive: moving to a Premium plan or a container to get a longer
-timeout would raise cost and operational surface for a job that is idle 95% of the time, and
-fanning branches out across parallel invocations would multiply API pressure against a vendor
-endpoint with no published rate limit.
-
-So the pipeline keeps the cheap serverless host and makes progress **resumable** instead. The unit
-of work is one branch, not one day. State lives in blob storage, not in memory. A run does as much
-as it safely can, writes down where it got to, and exits cleanly — and the next timer tick picks
-up from there. A day takes as many invocations as it takes.
-
-Four mechanisms follow directly from that decision.
-
-### 1. Checkpointing
-
-Each business day owns a `checkpoint.json` holding `pendingBranchCodes`, `completedBranchCodes`,
-`failedBranches`, per-branch attempt counts, and a snapshot of the branch catalog. Rows collected
-so far live beside it in `partial_data.json.gz`.
-
-A run loads both, works through the pending list, and writes both back. Resume is therefore just
-"read the pending list" — completed branches are never re-fetched within a day. Caching the branch
-catalog in the checkpoint also means a resume costs zero extra API calls before it starts doing
-useful work.
-
-When the pending list finally empties, the run assembles the immutable `data.json.gz` snapshot and
-flips the checkpoint to `completed`. That status field is the signal the transformer waits for.
-
-### 2. Blob lease as a distributed mutex
-
-Timer triggers can overlap — a slow run, a host restart, or a manual trigger during a scheduled
-one. Two workers mutating the same checkpoint would interleave their pending lists and lose
-branches.
-
-Each run therefore acquires an **Azure blob lease** on the day's checkpoint before touching it, and
-renews it mid-loop. A run that cannot get the lease logs and skips that day rather than competing
-for it.
-
-The failure mode that matters here is a worker dying while holding a lease. Rather than wait for
-the lease to expire on its own, each run writes a `lastHeartbeatAt` into the checkpoint body. A
-would-be successor that hits a 409 reads the heartbeat, and if it is older than three lease
-periods it **breaks** the lease and takes over. A crashed worker costs one lease period, not a
-stuck day.
-
-### 3. Self-imposed time budget
-
-The host timeout is 10 minutes; the extractor stops itself at 480 seconds by default
-(`EXTRACTOR_RUN_BUDGET_SECONDS`). Before each branch it checks elapsed time, and if the budget is
-spent it pushes the remaining branches back onto the pending list, persists, releases the lease,
-and returns normally.
-
-This is the difference between a graceful handoff and a kill. A killed invocation loses whatever
-was in memory and leaves a lease to expire; a budgeted exit leaves the day in a clean, resumable
-state and a green invocation in the logs. The ~2 minute margin absorbs a slow final branch and the
-blob writes.
-
-### 4. Failure isolation and attempt limiting
-
-One unreachable branch must not block a day, and must not retry forever. Failure handling is
-layered:
-
-- **Transport retries** — up to 3 attempts with linear backoff, and only for timeouts, connection
-  errors, and HTTP 429/500/502/503/504. A 400 or 404 fails immediately instead of burning the
-  budget on a request that will never succeed.
-- **Per-branch attempt cap** — a branch that fails is re-queued for a *later invocation*, not
-  retried in a tight loop. After `RISTA_BRANCH_ATTEMPTS` (default 2) it is moved to
-  `failedBranches` and the day proceeds without it. Recovery time is measured in minutes, and one
-  bad branch costs one branch.
-- **Empty-snapshot guard** — if every branch failed, the run raises instead of publishing an empty
-  snapshot. Publishing would flip the day to `completed` and trigger the transformer to delete a
-  day of Snowflake rows and replace them with nothing. This guard is the one that prevents a
-  source outage from becoming data loss.
-- **Pagination loop guard** — paging stops on an empty page, a missing cursor, a hard 500-page cap,
-  **or** a page byte-identical to the previous one. The last condition exists because a cursor that
-  stops advancing would otherwise spin until the page cap.
-
-### The transformer's own idempotency problem
-
-The transformer polls every 30 minutes, which is 48 runs a day against days that mostly have not
-changed. Reloading unchanged data would burn Snowflake credits and churn the tables for nothing.
-
-It uses the extraction timestamp as a **content fingerprint**. Each successful load records the
-snapshot's `extractedAt` into `transform_checkpoint.json`; a day is reloaded only when the current
-snapshot's `extractedAt` differs from the recorded one. Re-extraction naturally produces a new
-timestamp, so genuinely refreshed days are picked up automatically and untouched days cost one blob
-read.
-
-Loading itself is a **day-level delete-then-insert inside a single transaction**: delete every row
-for that `LAST_EXTRACTED_DAY` across all 13 tables, bulk insert the snapshot, convert the JSON
-string columns to native `VARIANT`, commit. Any failure rolls the whole day back, so a day is
-either fully replaced or untouched — never half-loaded.
-
----
-
-## Tech stack
-
-| Layer | Choice |
-|---|---|
-| Runtime | Python 3.11, Azure Functions v2 programming model (decorator-based, no `function.json`) |
-| Hosting | Linux Consumption plan, timer triggers, 10-minute timeout |
-| Source | Rista POS REST API — HMAC-signed JWT (HS256), cursor pagination |
-| Staging + state | Azure Blob Storage — gzipped JSON, blob leases for mutual exclusion |
-| Warehouse | Snowflake — RSA key-pair auth, `write_pandas` bulk load, `VARIANT` for nested JSON |
-| Secrets | Azure Key Vault referenced from App Settings |
-| Observability | Application Insights, plus per-HTTP-attempt CSV telemetry |
-| Tests | pytest against the pure transform |
-
-Dependencies are deliberately disjoint per app:
-
-```
-extractor_app     azure-functions, azure-storage-blob, PyJWT, requests, tzdata
-transformer_app   azure-functions, azure-storage-blob, cryptography, pandas,
-                  snowflake-connector-python[pandas], tzdata
+```mermaid
+flowchart TD
+    START(["timer fires"]) --> LEASE{"can I lease<br>this day?"}
+    LEASE -->|"no, someone has it"| SKIP(["skip the day"])
+    LEASE -->|"yes"| LOAD["load checkpoint<br>and partial rows"]
+    LOAD --> LEFT{"branches<br>pending?"}
+    LEFT -->|"none"| DONE["write data.json.gz<br>mark day complete"]
+    LEFT -->|"some"| TIME{"under<br>480 seconds?"}
+    TIME -->|"no"| SAVE["save progress<br>release lease"]
+    TIME -->|"yes"| FETCH["fetch next branch"]
+    FETCH --> LEFT
+    SAVE --> NEXT(["exit green<br>next tick carries on"])
+    DONE --> FIN(["day finished"])
 ```
 
----
+## The four things that make resuming work
 
-## Data flow
+### Progress lives in a file
 
-1. **Day selection.** The extractor decides which business days to advance: an explicit
-   `TARGET_DAYS` override, else a 7-day sweep started at 10:00 IST, else the standard schedule
-   (yesterday and today before 09:00 IST; today after).
-2. **Lock.** Acquire the blob lease on that day's checkpoint, or skip the day.
-3. **Branch catalog.** On first run for a day, fetch `/v1/branch/list` and seed the pending list
-   with every branch — active *and* inactive, since a closed branch can still have historical
-   invoices.
-4. **Fetch.** For each pending branch, page `/v1/sales/page?branch=&day=&lastKey=` to exhaustion.
-   Every record is stamped with `requestedDay` and `requestedStatus` — the day that was queried and
-   the invoice status *at extract time*, which is provenance the source does not provide.
-5. **Accumulate.** Dedupe on `(branchCode, invoiceNumber)` and append to the in-progress row set.
-6. **Persist or hand off.** Write partial data and checkpoint. If the budget is spent, exit for the
-   next tick; if the pending list is empty, publish `data.json.gz` and mark the day `completed`.
-7. **Fingerprint gate.** The transformer scans the last 8 calendar days and picks up any whose
-   snapshot `extractedAt` differs from what it last loaded.
-8. **Flatten.** One invoice becomes up to 13 rows: a header plus twelve child collections
-   (items, item options, item event log, item discounts, charges, discounts, payments, event log,
-   delivery, customer, source info, source customer). Nested arrays kept whole are serialized for
-   `VARIANT`; tax arrays additionally get summed into scalar companion columns.
-9. **Load.** Delete the day, bulk insert, `PARSE_JSON` the `VARIANT` columns, commit.
-10. **Record.** Write the transform checkpoint with the fingerprint, row count, and metrics.
+Each business day owns a `checkpoint.json`: which branches are still pending, which are done, which have failed for good, how many attempts each has had, and a cached copy of the branch catalog. The rows collected so far sit next to it in `partial_data.json.gz`.
 
-Failures at any step write a JSON dump — component, target day, error, traceback — to an `errors`
-container, then re-raise so the invocation is marked failed and surfaces in monitoring.
+Resuming is therefore just reading the pending list. Branches already fetched are never fetched twice within a day. Caching the branch catalog matters too, since it means a resumed run spends zero API calls before it starts doing useful work.
 
----
+When the pending list finally empties, the run builds the immutable `data.json.gz` snapshot and flips the checkpoint to `completed`. That status is what the transformer waits for.
 
-## Repository layout
+### A blob lease stops two runs fighting
 
-```
-extractor_app/                    Azure Function: API → Blob
-  function_app.py                 Timer entry point; per-day loop and error capture
-  shared/rista_client.py          HTTP client: JWT minting, retry policy, cursor pagination
-  shared/blob_storage.py          Blob I/O, checkpoint read/write, lease acquire/renew/break
-  shared/extraction_runner.py     The resumable engine: budget loop, dedupe, snapshot assembly
-  shared/work_plan.py             Which days to work; 7-day sweep job manifest lifecycle
-  shared/pipeline_schedule.py     Cron constants, IST helpers, day-list rules, refresh policy
-  shared/api_call_logger.py       One CSV row per HTTP attempt, including retries and failures
+Timer triggers overlap more often than you'd like. A slow run, a host restart, someone hitting the manual trigger while the schedule is already going. Two runs mutating the same checkpoint would interleave their pending lists and quietly lose branches.
 
-transformer_app/                  Azure Function: Blob → Snowflake
-  function_app.py                 Timer entry point; day selection and error capture
-  shared/day_reload.py            One-day orchestration, shared by the timer and the CLI
-  shared/blob_reader.py           Snapshot reads, completion/fingerprint gates, transform lease
-  shared/snowflake_loader.py      Key-pair auth, transactional delete+insert, VARIANT parsing
-  shared/invoice_keys.py          The single invoice-key normalization rule, imported by both
-  transformers/sales_transformer.py   Pure function: nested JSON → 13 flat row sets
-  scripts/historical_refresh.py   Local CLI to reload a date range from existing blobs
-  tests/                          Unit tests for the transform
+So a run takes an **Azure blob lease** on the day's checkpoint before touching it, and renews it as it works. A run that can't get the lease logs why and skips that day.
 
-sql/
-  001_setup_env.sql               Warehouse, database, RAW schema, loader role and service user
-  003_sales_tables.sql            14 table DDL with grants and clustering
-  004_sales_variant_parse.sql     Standalone PARSE_JSON pass (the loader does this itself)
-  005_sales_validation.sql        Post-load audit: PK duplicates, orphans, consistency, summary
+The interesting case is a worker that dies while holding one. Rather than wait for the lease to lapse, every run stamps a `lastHeartbeatAt` into the checkpoint body. A later run that gets a 409 reads that heartbeat, and if it's older than three lease periods it breaks the lease and takes over. A crashed worker costs one lease period instead of jamming the day until someone notices.
 
-docs/
-  section-04-sales-schema.md      Nested-JSON→table mapping and column catalog
-  section-05-sales-load-merge.md  Merge design — NOT IMPLEMENTED; see §0 in that file
-  section-06-sales-extract-schedule.md   Schedules, day selection, checkpoint resume
-```
+### Quit before you're killed
 
-Two details worth calling out. `invoice_keys.py` is five lines and is imported by both the
-transform and the loader, because the invoice key is the join key for all 13 tables and the two
-sides normalizing it differently would produce silent orphans. And `sales_transformer.py` is a
-pure function by design — no I/O, no database, no environment reads — which is what makes it
-directly testable.
+The host gives you 600 seconds. The extractor stops itself at 480 (`EXTRACTOR_RUN_BUDGET_SECONDS`). It checks the clock before each branch, and when the budget is gone it pushes the remaining branches back onto the pending list, saves, releases the lease and returns normally.
 
----
+The difference between that and getting killed is not subtle. A killed invocation loses whatever was in memory, leaves a lease to expire, and shows up red in your monitoring for a reason that has nothing to do with your data. A budgeted exit leaves the day clean and resumable, and the run shows green because nothing went wrong. The 120-second gap absorbs a slow last branch plus the blob writes.
+
+### One bad branch shouldn't cost you the day
+
+Failure handling is layered, because "retry" means different things at different timescales.
+
+At the HTTP level: 3 attempts, linear backoff, and only for timeouts, connection errors and 429/500/502/503/504. A 400 or a 404 fails immediately instead of spending the run's budget on a request that is never going to work.
+
+At the branch level: a failed branch goes back on the pending list for a *later invocation*, not a tight retry loop. After `RISTA_BRANCH_ATTEMPTS` (default 2) it moves to `failedBranches` and the day carries on without it. Recovery time is measured in minutes, and a genuinely dead branch costs you that branch.
+
+Then two guards that exist for specific bad outcomes:
+
+If every branch failed, the run raises instead of publishing an empty snapshot. Publishing would mark the day `completed`, the transformer would pick it up, delete a day of Snowflake rows and insert nothing. This is the check that keeps a vendor outage from turning into data loss.
+
+Pagination stops on an empty page, a missing cursor, a 500-page cap, or a page byte-for-byte identical to the one before it. That last condition is there because a cursor that stops advancing would otherwise spin happily until it hit the page cap.
+
+## The transformer's version of the same problem
+
+The transformer wakes up every 30 minutes. That's 48 runs a day, against days that have mostly not changed. Reloading unchanged data would burn Snowflake credits and churn the tables for nothing.
+
+It uses the extraction timestamp as a fingerprint. Each successful load writes the snapshot's `extractedAt` into `transform_checkpoint.json`, and a day is only reloaded when the snapshot's timestamp differs from the recorded one. Re-extracting a day naturally produces a new timestamp, so refreshed days get picked up on their own and untouched days cost one blob read.
+
+The load itself replaces a whole business day inside one transaction: delete every row for that `LAST_EXTRACTED_DAY` across all 13 tables, bulk insert the snapshot, convert the JSON string columns to native `VARIANT`, commit. Any failure rolls back the lot, so a day is either fully replaced or completely untouched. Never half-loaded, which is the state you really don't want to debug.
 
 ## Data model
 
-One row per invoice in `SALES_HEADER`, keyed on `INVOICE_NUMBER`, with twelve child tables keyed
-on the invoice plus a positional sequence or line number. Every table also carries
-`LAST_EXTRACTED_DAY` (the business day whose extract last wrote the row), `LOADED_AT`, and
-`UPDATED_AT`.
+One row per invoice in `SALES_HEADER`, keyed on `INVOICE_NUMBER`, with 12 child tables hanging off it keyed on the invoice plus a line number or a positional sequence. Every table carries `LAST_EXTRACTED_DAY` (the business day whose extract last wrote the row), `LOADED_AT` and `UPDATED_AT`.
 
-Nested JSON is handled three ways, chosen per field:
+Nested JSON gets one of three treatments, picked per field:
 
-| Strategy | When | Example |
+| Treatment | Used when | Example |
 |---|---|---|
-| Flatten to parent columns | Single-level object of scalars | `deliveryBy` → `DELIVERY_BY_NAME`, `DELIVERY_BY_PHONE` |
-| Child table | Array of records worth querying relationally | `items[]`, `payments[]`, `charges[]` |
-| `VARIANT` + summary column | Array kept whole, but with a common aggregate | `taxes[]` → `TAXES_DETAIL` plus `TAXES_TOTAL_AMOUNT` |
+| Flatten into the parent | One level of scalars | `deliveryBy` becomes `DELIVERY_BY_NAME`, `DELIVERY_BY_PHONE` |
+| Child table | An array you'll want to join and aggregate | `items[]`, `payments[]`, `charges[]` |
+| `VARIANT` plus a summary column | Keep the array whole, but pre-compute the number everyone asks for | `taxes[]` becomes `TAXES_DETAIL` and `TAXES_TOTAL_AMOUNT` |
 
-The third pattern is the one that earns its keep: routine reporting reads a pre-computed scalar and
-never pays to traverse semi-structured data, while the full array stays available for audit.
+The third one does the most work. Analysts asking for tax totals or tag counts read a plain numeric column and never pay to traverse semi-structured data, and the full array is still sitting there when someone needs to audit a specific bill.
 
-Full column catalog and mapping table: [`docs/section-04-sales-schema.md`](docs/section-04-sales-schema.md).
+Full column catalog: [`docs/section-04-sales-schema.md`](docs/section-04-sales-schema.md).
 
----
+## Repo layout
 
-## Configuration
+```
+extractor_app/                  Azure Function: API to Blob
+  function_app.py               Timer entry point, per-day loop, error capture
+  shared/rista_client.py        HTTP client: JWT minting, retry policy, cursor pagination
+  shared/blob_storage.py        Blob IO, checkpoint read/write, lease acquire/renew/break
+  shared/extraction_runner.py   The resumable engine: budget loop, dedupe, snapshot assembly
+  shared/work_plan.py           Which days to work on, 7-day sweep job manifest
+  shared/pipeline_schedule.py   Cron constants, IST helpers, day-selection rules
+  shared/api_call_logger.py     One CSV row per HTTP attempt, retries and failures included
 
-Both apps read configuration from environment variables (App Settings on Azure,
-`local.settings.json` locally). Copy `local.settings.example.json` in each app folder and fill it
-in; both example files contain placeholders only.
+transformer_app/                Azure Function: Blob to Snowflake
+  function_app.py               Timer entry point, day selection, error capture
+  shared/day_reload.py          One-day orchestration, shared by the timer and the CLI
+  shared/blob_reader.py         Snapshot reads, completion and fingerprint gates, lease
+  shared/snowflake_loader.py    Key-pair auth, transactional replace, VARIANT parsing
+  shared/invoice_keys.py        The one invoice-key normalisation rule, imported by both sides
+  transformers/sales_transformer.py   Pure function: nested JSON to 13 flat row sets
+  scripts/historical_refresh.py Local CLI, reload a date range from blobs already on disk
+  tests/                        Unit tests for the transform
 
-**Extractor** — `RISTA_API_KEY`, `RISTA_SECRET_KEY`, `RISTA_BASE_URL`, `AZURE_STORAGE_ACCOUNT`,
-`AZURE_STORAGE_KEY`, `AZURE_RAW_CONTAINER`, `AZURE_ERROR_CONTAINER`, plus tuning:
-`EXTRACTOR_RUN_BUDGET_SECONDS`, `EXTRACTOR_LEASE_SECONDS`, `RISTA_MAX_PAGES`,
-`RISTA_REQUEST_TIMEOUT`, `RISTA_MAX_RETRIES`, `RISTA_RETRY_BACKOFF_SECONDS`,
-`RISTA_BRANCH_ATTEMPTS`, `API_CALL_LOG_DIR`, `EXTRACTOR_FORCE_REFRESH`.
+sql/
+  001_setup_env.sql             Warehouse, database, RAW schema, loader role, service user
+  003_sales_tables.sql          14-table DDL with grants and clustering
+  004_sales_variant_parse.sql   Standalone PARSE_JSON pass (the loader does this itself)
+  005_sales_validation.sql      Post-load audit: PK duplicates, orphans, consistency, summary
 
-**Transformer** — `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `SNOWFLAKE_ACCOUNT`,
-`SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY` (PEM body only, no BEGIN/END lines),
-`SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`,
-`SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_ROLE`, `TRANSFORM_LEASE_SECONDS`.
+docs/                           Schema mapping, load design, schedule design
+```
 
-**Both** — `PIPELINE_TIMEZONE` (default `Asia/Kolkata`), `TARGET_DAY` / `TARGET_DAYS`.
-On Azure also set `WEBSITE_TIME_ZONE=India Standard Time`, since the cron expressions are
-evaluated in the app's timezone and the 7-day sweep triggers on a specific local hour.
-
-> **Operational hazard.** `TARGET_DAY` / `TARGET_DAYS` override *all* day-selection logic on both
-> apps, and on the extractor they also force re-extraction of the named days. Left set after a
-> backfill, they silently pin the pipeline to a past date and current data stops flowing. There is
-> no guard, no expiry, and no warning log — clear them when a backfill finishes.
-
-Secrets belong in Key Vault, referenced from App Settings as
-`@Microsoft.KeyVault(VaultName=<vault>;SecretName=<name>)`, with the function app's managed
-identity granted **Key Vault Secrets User**.
-
----
+Two files are smaller than they look. `invoice_keys.py` is five lines, and both the transform and the loader import it, because the invoice number is the join key for all 13 tables and two sides normalising it differently would produce orphan rows that nothing complains about. And `sales_transformer.py` does no IO at all, reads no environment, touches no database. That's deliberate, and it's why it's the one thing here with real test coverage.
 
 ## Running it
 
-Full walkthrough, including key-pair generation and manual triggering:
-[`RUN_LOCAL.md`](RUN_LOCAL.md).
+Full walkthrough including key generation and manual triggering: [`RUN_LOCAL.md`](RUN_LOCAL.md).
 
 ```powershell
-# Snowflake objects, once
-#   run sql/001_setup_env.sql, then sql/003_sales_tables.sql
+# once: run sql/001_setup_env.sql then sql/003_sales_tables.sql
 
-# Either app
 cd extractor_app                 # or transformer_app
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy local.settings.example.json local.settings.json   # then fill in values
+copy local.settings.example.json local.settings.json    # then fill it in
 func start --port 7071           # 7072 for the transformer
 ```
 
-Trigger a timer function manually via the admin endpoint:
+Timer functions have no HTTP route, so trigger them through the admin endpoint:
 
 ```powershell
 Invoke-RestMethod -Method Post `
@@ -341,8 +204,21 @@ Invoke-RestMethod -Method Post `
   -ContentType "application/json" -Body '{"input":""}'
 ```
 
-Because one invocation only *advances* a day, repeat until the logs show
-`Extraction completed for <day>`.
+One invocation only *advances* a day, so keep triggering until you see `Extraction completed for <day>`.
+
+### Configuration
+
+Both apps read environment variables (App Settings on Azure, `local.settings.json` locally). The example files in each app folder contain placeholders only.
+
+Extractor: `RISTA_API_KEY`, `RISTA_SECRET_KEY`, `RISTA_BASE_URL`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `AZURE_RAW_CONTAINER`, `AZURE_ERROR_CONTAINER`, and tuning knobs `EXTRACTOR_RUN_BUDGET_SECONDS`, `EXTRACTOR_LEASE_SECONDS`, `RISTA_MAX_PAGES`, `RISTA_REQUEST_TIMEOUT`, `RISTA_MAX_RETRIES`, `RISTA_RETRY_BACKOFF_SECONDS`, `RISTA_BRANCH_ATTEMPTS`, `API_CALL_LOG_DIR`, `EXTRACTOR_FORCE_REFRESH`.
+
+Transformer: `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY` (PEM body only, no BEGIN/END lines), `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_ROLE`, `TRANSFORM_LEASE_SECONDS`.
+
+Both: `PIPELINE_TIMEZONE` (defaults to `Asia/Kolkata`), `TARGET_DAY` / `TARGET_DAYS`. On Azure also set `WEBSITE_TIME_ZONE=India Standard Time`, because the cron expressions are evaluated in the app's timezone and the 7-day sweep fires on a specific local hour.
+
+Secrets belong in Key Vault, referenced from App Settings as `@Microsoft.KeyVault(VaultName=<vault>;SecretName=<name>)`, with the function app's managed identity granted **Key Vault Secrets User**.
+
+> **Watch out for `TARGET_DAY`.** It overrides all day-selection logic on both apps, and on the extractor it also forces re-extraction of the days you name. Leave it set after a backfill and the pipeline stays pinned to a date in the past while current data silently stops arriving. There's no guard, no expiry, no warning in the logs. Clear it when you're done.
 
 ### Tests
 
@@ -352,111 +228,60 @@ pip install -r requirements-dev.txt
 python -m pytest tests -v
 ```
 
-26 tests covering the transform: invoice-key normalization, child fan-out and sequence numbering,
-`VARIANT` serialization, tax and refund summing, the upstream field-name typo, empty-array →
-`NULL` handling, and the batch-level invariant that every row in one call shares a load timestamp.
-No network, storage, or database required.
+26 tests on the transform: invoice-key normalisation, child fan-out and sequence numbering, `VARIANT` serialisation, tax and refund summing, the vendor's misspelled field name, empty arrays becoming `NULL` rather than the string `"[]"`, and the invariant that every row produced by one call shares a load timestamp. No network, no storage, no database.
 
-### Backfill
+### Backfilling
 
 ```powershell
 cd transformer_app
 python scripts/historical_refresh.py --start 2026-05-01 --end 2026-05-28 --dry-run
 ```
 
-Reloads Snowflake from blobs that already exist, one shared connection for the range, committing
-per day. Requires a completed snapshot per day — run the extractor for missing days first.
+Reloads Snowflake from snapshots already in blob storage, on one connection for the whole range, committing per day. Needs a completed snapshot for each day, so run the extractor first for anything missing.
 
----
+## Data quality and known limitations
 
-## Data quality & known limitations
+The parts worth knowing before you trust a number that came out of this. Items marked *(from code review)* were found by reading the code and haven't been reproduced in a controlled test.
 
-Honest inventory. Items marked **(code review)** were found by reading the code and have not been
-reproduced in a controlled test.
+### Designed, never built
 
-### Designed but not implemented
+`docs/section-05` describes a per-invoice merge: compare the incoming `NET_AMOUNT` against the stored row, skip invoices that haven't changed, and write paired `SUPERSEDED`/`INCOMING` audit rows into `SALES_INVOICE_HISTORY` when one has. **None of it was implemented.** The loader replaces the whole day. `SALES_INVOICE_HISTORY` gets created by the DDL and stays empty forever. The `skipped`, `replaced` and `history_rows` metrics are hardcoded zeros.
 
-**Per-invoice merge and change history.** [`docs/section-05`](docs/section-05-sales-load-merge.md)
-specifies comparing incoming `NET_AMOUNT` against the stored row, skipping unchanged invoices, and
-writing paired `SUPERSEDED`/`INCOMING` audit rows to `SALES_INVOICE_HISTORY` on a change. **None of
-it was built.** The loader does a day-level delete-then-insert, `SALES_INVOICE_HISTORY` is created
-by the DDL but never written, and the `skipped` / `replaced` / `history_rows` metrics are hardcoded
-to `0`.
+Two things follow for anyone querying this data:
 
-Consequences to be aware of when querying:
+There is **no change history**. If a bill is amended upstream and the day gets re-extracted, the old values are gone with no record that anything moved.
 
-- There is **no change history**. If an invoice's total is amended upstream and the day is
-  re-extracted, the previous value is overwritten with no record that it changed.
-- `SALES_INVOICE_HISTORY` always returns zero rows, as do the audit checks in `sql/005` §8.
+`SALES_INVOICE_HISTORY` always returns zero rows, and so do the audit checks in `sql/005` §8.
 
-The docs and SQL that describe the merge have been annotated in place rather than deleted, so the
-design record survives without misleading a reader about current behaviour.
+I annotated the docs and SQL in place rather than deleting them, so the design is still on record without misleading anyone about what runs today.
 
-### Known bugs
+### Bugs
 
-**The 7-day sweep can fail to drain, and blocks the normal schedule when it does. (code review)**
-In `extractor_app/function_app.py`, a day whose checkpoint is already `completed` returns
-`{"status": "completed", "skipped": True}`, and the `skipped` early-`continue` fires *before* the
-code that removes the day from the sweep's `pendingDays`. Because `should_force_refresh()` returns
-`False` for a completed day, a sweep over days that are already extracted removes nothing from its
-own queue. An `in_progress` sweep outranks the normal schedule and also prevents a replacement
-sweep from starting, so the loop has no exit.
+**The 7-day sweep can fail to drain, and blocks the normal schedule while it's stuck.** *(from code review)*
 
-Setting `EXTRACTOR_FORCE_REFRESH=true` makes those days genuinely re-extract and the queue drains —
-which is why the symptom may not appear in a deployment that has it enabled. To diagnose, check
-whether `rista/sales/jobs/timeline2.json` has a stale `startedOnDate` with a non-empty
-`pendingDays`.
+In `extractor_app/function_app.py`, a day whose checkpoint already says `completed` returns `skipped`, and the early `continue` for skipped days fires *before* the code that removes the day from the sweep's `pendingDays`. Since `should_force_refresh()` returns `False` for a completed day, a sweep across days that are already extracted removes nothing from its own queue. An in-progress sweep outranks the normal schedule and also stops a replacement sweep from starting, so there's no way out of the loop.
 
-**Type coercion hooks are inert.** `snowflake_loader.py` defines
-`_coerce_dataframe_date_columns` and `_coerce_dataframe_decimal_columns`, but their driving
-dictionaries (`DATE_COLUMNS_BY_TABLE`, `DECIMAL_COLUMNS_BY_TABLE`) are empty, so both are no-ops.
-Date and numeric normalization currently relies entirely on Snowflake's implicit casting during
-`write_pandas`. Out-of-range or unexpectedly-typed values will surface as a load error rather than
-being coerced or rejected per column.
+Setting `EXTRACTOR_FORCE_REFRESH=true` makes those days genuinely re-extract, which drains the queue, which is why the symptom may never appear in a deployment that has the flag on. To check: look at `rista/sales/jobs/timeline2.json` for a stale `startedOnDate` sitting next to a non-empty `pendingDays`.
 
-**The API-call CSV logger writes into the deployment directory. (code review)**
-`api_call_logger.py` defaults to `extractor_app/logs/api_calls/`, which lives under
-`/home/site/wwwroot` on Azure — read-only when running from package. `mkdir()` is called inside the
-leased section and before the surrounding try block, so a failure there would fail the whole
-extraction. Set `API_CALL_LOG_DIR` to a writable path, or treat this as a local-only tool. The logs
-are ephemeral on Consumption regardless; Application Insights is the real observability surface.
+**Type coercion is wired up but switched off.** `snowflake_loader.py` defines `_coerce_dataframe_date_columns` and `_coerce_dataframe_decimal_columns`, but the dictionaries that drive them (`DATE_COLUMNS_BY_TABLE`, `DECIMAL_COLUMNS_BY_TABLE`) are empty, so both functions do nothing. Date and numeric handling relies entirely on Snowflake's implicit casting during `write_pandas`. An out-of-range or oddly-typed value surfaces as a failed load rather than being coerced or rejected per column.
+
+**The API-call CSV log writes into the deployment directory.** *(from code review)* `api_call_logger.py` defaults to `extractor_app/logs/api_calls/`, which on Azure lives under `/home/site/wwwroot` and is read-only when the app runs from package. The `mkdir()` happens inside the leased section and before the surrounding try block, so a failure there takes the whole extraction down with it. Point `API_CALL_LOG_DIR` somewhere writable or treat the CSV as a local debugging tool. Either way the files are ephemeral on Consumption; Application Insights is the real observability surface.
 
 ### Design limits
 
-**The delete key is not the primary key.** Deletes target `LAST_EXTRACTED_DAY` while the declared
-primary key is `INVOICE_NUMBER`, and Snowflake does not enforce primary keys. If the same invoice
-ever arrives under two different `target_day` values, two header rows coexist. `sql/005`'s
-duplicate check groups *within* one `LAST_EXTRACTED_DAY`, so it is structurally blind to this; a
-cross-day duplicate check would need adding.
+**The delete key isn't the primary key.** Deletes target `LAST_EXTRACTED_DAY`. The declared primary key is `INVOICE_NUMBER`, and Snowflake doesn't enforce primary keys. If the same invoice ever turns up under two different `target_day` values you get two header rows and nothing notices, because the duplicate check in `sql/005` groups *within* a single `LAST_EXTRACTED_DAY`. A cross-day check would need adding.
 
-**Dedupe grain differs between the two stages.** The extractor dedupes on
-`(branchCode, invoiceNumber)`; the loader dedupes headers on `invoiceNumber` alone. If two branches
-ever shared an invoice number, one header would win while child rows from both survive, attaching
-children to the wrong branch's header. A warning is logged when the loader drops a duplicate.
+**The two stages dedupe on different keys.** The extractor dedupes on `(branchCode, invoiceNumber)`; the loader dedupes headers on `invoiceNumber` alone. If two branches ever shared an invoice number, one header would win while child rows from both survive, quietly attaching children to the wrong branch's header. The loader logs a warning when it drops a duplicate, which is the only signal you'd get.
 
-**`pipeline_schedule.py` is duplicated across both apps and has already drifted.** The transformer's
-copy lacks the sweep logic the extractor's has. They should be a shared package or an installable
-module; the duplication was left in place here rather than restructured, since consolidating it
-across two independently deployed function apps is a packaging change, not a refactor.
+**`pipeline_schedule.py` is duplicated across both apps and has already drifted.** The transformer's copy is missing the sweep logic the extractor's has. It should be a shared installable package. I left the duplication in place here because consolidating it across two independently deployed function apps is a packaging change, not a refactor, and doing it badly is worse than documenting it.
 
-**Partial rows are persisted once per run, not incrementally.** A hard crash mid-run discards that
-run's collected branches. They remain pending so no data is lost, but up to a full budget window of
-API work is repeated.
+**Partial rows are saved once per run, not incrementally.** A hard crash mid-run throws away that run's collected branches. They stay pending so no data is lost, but up to a full budget window of API calls gets repeated.
 
-**A whole day is held in memory.** The accumulated row set is deduped per branch
-(`_dedupe_sales_records(rows + branch_rows)` rebuilds the dict each time, so O(n × branches)) and
-the full day is resident before gzipping. Adequate at current volume; this is the first ceiling the
-design will hit.
+**A whole day sits in memory.** The accumulated rows get deduped once per branch (`_dedupe_sales_records(rows + branch_rows)` rebuilds the dict every time, so O(n × branches)) and the full day is resident before it's gzipped. Fine at current volume. This is the first ceiling the design will hit.
 
-**One failing day aborts the rest of that tick.** Errors are re-raised after being written to blob
-so the invocation shows as failed. A persistently broken day therefore blocks the other days queued
-behind it until it is fixed or excluded.
+**One failing day takes the rest of the tick with it.** Errors are written to blob and then re-raised so the invocation shows as failed, which means a persistently broken day blocks the days queued behind it until someone fixes or excludes it.
 
-**Minor:** `UPDATED_AT` is always set equal to `LOADED_AT`, so it carries no independent
-information. `RISTA_BRANCH_RETRY_BACKOFF_SECONDS` is read into the client but never used — branch
-retries wait for the next timer tick instead.
-
----
+**Smaller things.** `UPDATED_AT` is always set to the same value as `LOADED_AT`, so it tells you nothing. `RISTA_BRANCH_RETRY_BACKOFF_SECONDS` is read into the client and never used, since branch retries wait for the next timer tick instead.
 
 ## License
 
