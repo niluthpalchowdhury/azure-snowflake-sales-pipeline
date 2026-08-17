@@ -1,0 +1,4 @@
+# Development-only dependencies. Not deployed to Azure — see .funcignore.
+# The transform tests import only stdlib plus the transform module itself, so the
+# runtime dependencies in requirements.txt are not needed to run them.
+pytest>=8.0
